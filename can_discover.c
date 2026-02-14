@@ -20,6 +20,25 @@ const char *disc_signal_name(disc_signal_t sig) {
     return s_signal_names[sig];
 }
 
+static const char *s_conf_names[] = { "HIGH", "MEDIUM", "LOW" };
+static const char *s_endian_names[] = { "unknown", "big", "little" };
+static const char *s_sign_names[] = { "unknown", "unsigned", "signed" };
+
+const char *disc_confidence_name(disc_confidence_t conf) {
+    if (conf > DISC_CONF_LOW) return "UNKNOWN";
+    return s_conf_names[conf];
+}
+
+const char *disc_endian_name(disc_endian_t e) {
+    if (e > DISC_ENDIAN_LITTLE) return "unknown";
+    return s_endian_names[e];
+}
+
+const char *disc_sign_name(disc_sign_t s) {
+    if (s > DISC_SIGN_SIGNED) return "unknown";
+    return s_sign_names[s];
+}
+
 /*******************************************************************************
  * Phase Capture
  ******************************************************************************/
@@ -284,6 +303,7 @@ static bool classify_steering(const id_cmp_t *results, int count,
         if (r->best_byte >= 0 && r->second_byte >= 0 &&
             abs(r->best_byte - r->second_byte) == 1) {
             fill_candidate(out, r);
+            out->confidence = DISC_CONF_HIGH;
             return true;
         }
     }
@@ -292,6 +312,8 @@ static bool classify_steering(const id_cmp_t *results, int count,
     int idx = find_best(results, count, excl, excl_count);
     if (idx >= 0) {
         fill_candidate(out, &results[idx]);
+        out->confidence = (results[idx].total_score >= 20.0)
+                          ? DISC_CONF_MEDIUM : DISC_CONF_LOW;
         return true;
     }
     return false;
@@ -323,6 +345,7 @@ static void classify_throttle_rpm(const id_cmp_t *results, int count,
     if (top_count == 1) {
         /* Only one candidate — assign to RPM (more valuable for motorsport) */
         fill_candidate(rpm_out, &results[top_idx[0]]);
+        rpm_out->confidence = DISC_CONF_MEDIUM;
         *rpm_found = true;
         return;
     }
@@ -366,10 +389,14 @@ static void classify_throttle_rpm(const id_cmp_t *results, int count,
 
     if (rpm_idx >= 0) {
         fill_candidate(rpm_out, &results[top_idx[rpm_idx]]);
+        const id_cmp_t *rr = &results[top_idx[rpm_idx]];
+        rpm_out->confidence = (rr->changed_bytes >= 2 && rr->hz >= 30.0)
+                              ? DISC_CONF_HIGH : DISC_CONF_MEDIUM;
         *rpm_found = true;
     }
     if (throttle_idx >= 0) {
         fill_candidate(throttle_out, &results[top_idx[throttle_idx]]);
+        throttle_out->confidence = (top_count >= 2) ? DISC_CONF_HIGH : DISC_CONF_MEDIUM;
         *throttle_found = true;
     }
 }
@@ -383,6 +410,10 @@ static bool classify_brake(const id_cmp_t *results, int count,
     int idx = find_best(results, count, excl, excl_count);
     if (idx >= 0) {
         fill_candidate(out, &results[idx]);
+        out->confidence = (results[idx].total_score >= 20.0)
+                          ? DISC_CONF_HIGH
+                          : (results[idx].total_score >= 8.0)
+                            ? DISC_CONF_MEDIUM : DISC_CONF_LOW;
         return true;
     }
     return false;
@@ -411,6 +442,7 @@ static bool classify_gear(const id_cmp_t *results, int count,
                 fill_candidate(out, r);
                 out->byte_idx = b;
                 out->byte2_idx = -1;
+                out->confidence = DISC_CONF_HIGH;
                 return true;
             }
         }
@@ -420,6 +452,7 @@ static bool classify_gear(const id_cmp_t *results, int count,
     int idx = find_best(results, count, excl, excl_count);
     if (idx >= 0) {
         fill_candidate(out, &results[idx]);
+        out->confidence = DISC_CONF_LOW;
         return true;
     }
     return false;
@@ -440,6 +473,7 @@ static bool classify_wheel_speed(const id_cmp_t *results, int count,
         const id_cmp_t *r = &results[i];
         if (r->changed_bytes >= 4 && r->hz >= 30.0) {
             fill_candidate(out, r);
+            out->confidence = DISC_CONF_HIGH;
             return true;
         }
     }
@@ -450,6 +484,7 @@ static bool classify_wheel_speed(const id_cmp_t *results, int count,
         const id_cmp_t *r = &results[i];
         if (r->changed_bytes >= 2 && r->hz >= 30.0) {
             fill_candidate(out, r);
+            out->confidence = DISC_CONF_MEDIUM;
             return true;
         }
     }
@@ -458,13 +493,164 @@ static bool classify_wheel_speed(const id_cmp_t *results, int count,
     int idx = find_best(results, count, excl, excl_count);
     if (idx >= 0) {
         fill_candidate(out, &results[idx]);
+        out->confidence = DISC_CONF_LOW;
         return true;
     }
     return false;
 }
 
 /*******************************************************************************
- * Main Analysis
+ * Signal Characterization
+ ******************************************************************************/
+
+/** Find a CAN ID in a phase. Returns NULL if not found. */
+static const disc_id_t *find_id_in_phase(const disc_phase_t *phase,
+                                           uint32_t can_id) {
+    for (int i = 0; i < phase->id_count; i++) {
+        if (phase->ids[i].can_id == can_id) return &phase->ids[i];
+    }
+    return NULL;
+}
+
+/**
+ * Check if MSB byte has a bimodal distribution around the 0x00/0xFF boundary,
+ * indicating a signed value that crosses zero.
+ */
+static bool msb_looks_signed(const disc_byte_t *msb) {
+    bool near_zero = false;     /* values in [0x00, 0x1F] */
+    bool near_ff = false;       /* values in [0xE0, 0xFF] */
+    bool has_middle = false;    /* values in [0x40, 0xBF] */
+
+    for (int v = 0; v <= 0x1F; v++)
+        if (msb->seen[v]) { near_zero = true; break; }
+    for (int v = 0xE0; v <= 0xFF; v++)
+        if (msb->seen[v]) { near_ff = true; break; }
+    for (int v = 0x40; v <= 0xBF; v++)
+        if (msb->seen[v]) { has_middle = true; break; }
+
+    return near_zero && near_ff && !has_middle;
+}
+
+void disc_characterize(const disc_phase_t *active, disc_candidate_t *cand) {
+    cand->endianness = DISC_ENDIAN_UNKNOWN;
+    cand->signedness = DISC_SIGN_UNKNOWN;
+    cand->raw_min = 0;
+    cand->raw_max = 0;
+
+    const disc_id_t *id = find_id_in_phase(active, cand->can_id);
+    if (!id || cand->byte_idx < 0) return;
+
+    if (cand->byte2_idx < 0) {
+        /* --- Single-byte signal --- */
+        const disc_byte_t *b = &id->bytes[cand->byte_idx];
+        cand->signedness = DISC_SIGN_UNSIGNED;
+        cand->raw_min = b->min_val;
+        cand->raw_max = b->max_val;
+        return;
+    }
+
+    /* --- Two-byte signal --- */
+    const disc_byte_t *b1 = &id->bytes[cand->byte_idx];
+    const disc_byte_t *b2 = &id->bytes[cand->byte2_idx];
+
+    int range1 = b1->max_val - b1->min_val;
+    int range2 = b2->max_val - b2->min_val;
+
+    /* MSB has smaller range (fewer distinct high-order values) */
+    int msb_idx, lsb_idx;
+    const disc_byte_t *msb, *lsb;
+    if (range1 <= range2) {
+        msb_idx = cand->byte_idx;  lsb_idx = cand->byte2_idx;
+        msb = b1; lsb = b2;
+    } else {
+        msb_idx = cand->byte2_idx; lsb_idx = cand->byte_idx;
+        msb = b2; lsb = b1;
+    }
+
+    /* Endianness: MSB at lower address = big-endian */
+    if (msb_idx < lsb_idx)
+        cand->endianness = DISC_ENDIAN_BIG;
+    else
+        cand->endianness = DISC_ENDIAN_LITTLE;
+
+    /* Reorder byte_idx/byte2_idx: byte_idx = MSB, byte2_idx = LSB */
+    cand->byte_idx = msb_idx;
+    cand->byte2_idx = lsb_idx;
+
+    /* Signedness: check MSB for bimodal zero-crossing pattern */
+    bool is_signed = msb_looks_signed(msb);
+    cand->signedness = is_signed ? DISC_SIGN_SIGNED : DISC_SIGN_UNSIGNED;
+
+    /* Raw range (approximate from per-byte stats) */
+    uint16_t u_min = ((uint16_t)msb->min_val << 8) | lsb->min_val;
+    uint16_t u_max = ((uint16_t)msb->max_val << 8) | lsb->max_val;
+
+    if (is_signed) {
+        cand->raw_min = (int16_t)u_min;
+        cand->raw_max = (int16_t)u_max;
+        /* Ensure min <= max for signed (wrap-around case) */
+        if (cand->raw_min > cand->raw_max) {
+            int32_t tmp = cand->raw_min;
+            cand->raw_min = cand->raw_max;
+            cand->raw_max = tmp;
+        }
+    } else {
+        cand->raw_min = u_min;
+        cand->raw_max = u_max;
+    }
+}
+
+/*******************************************************************************
+ * Per-Signal Classification (Public API)
+ ******************************************************************************/
+
+bool disc_classify(const disc_phase_t *baseline,
+                   const disc_phase_t *active,
+                   disc_signal_t signal,
+                   const uint32_t *excl, int excl_count,
+                   disc_candidate_t *out,
+                   disc_candidate_t *rpm_out, bool *rpm_found) {
+    id_cmp_t cmp_buf[DISC_MAX_IDS];
+    int n = compare_phases(baseline, active, cmp_buf, DISC_MAX_IDS);
+
+    memset(out, 0, sizeof(*out));
+    out->byte_idx = -1;
+    out->byte2_idx = -1;
+
+    switch (signal) {
+    case DISC_SIG_STEERING:
+        return classify_steering(cmp_buf, n, excl, excl_count, out);
+    case DISC_SIG_THROTTLE: {
+        /* Throttle phase detects both RPM and throttle */
+        bool t_found = false, r_found = false;
+        disc_candidate_t t_cand = {0}, r_cand = {0};
+        t_cand.byte_idx = -1; t_cand.byte2_idx = -1;
+        r_cand.byte_idx = -1; r_cand.byte2_idx = -1;
+        classify_throttle_rpm(cmp_buf, n, excl, excl_count,
+                               &t_cand, &t_found, &r_cand, &r_found);
+        if (t_found) *out = t_cand;
+        if (rpm_out && rpm_found) {
+            *rpm_found = r_found;
+            if (r_found) *rpm_out = r_cand;
+        }
+        return t_found;
+    }
+    case DISC_SIG_RPM:
+        /* RPM is detected via DISC_SIG_THROTTLE; standalone not supported */
+        return false;
+    case DISC_SIG_BRAKE:
+        return classify_brake(cmp_buf, n, excl, excl_count, out);
+    case DISC_SIG_GEAR:
+        return classify_gear(cmp_buf, n, excl, excl_count, out);
+    case DISC_SIG_WHEEL_SPEED:
+        return classify_wheel_speed(cmp_buf, n, excl, excl_count, out);
+    default:
+        return false;
+    }
+}
+
+/*******************************************************************************
+ * Main Analysis (Batch)
  ******************************************************************************/
 
 void disc_analyze(const disc_phase_t phases[DISC_NUM_PHASES],

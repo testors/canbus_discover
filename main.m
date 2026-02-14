@@ -820,108 +820,260 @@ static const struct {
     const char *name;
     int         duration_s;
     const char *instruction;
+    const char *warning;        /**< NULL if no special warning */
 } s_disc_phases[DISC_NUM_PHASES] = {
-    { "Baseline",     5,  "Keep engine running. Do NOT touch any controls." },
-    { "Steering",     5,  "Turn steering wheel LEFT and RIGHT repeatedly." },
-    { "Throttle",     8,  "Press and release the accelerator pedal 2-3 times." },
-    { "Brake",        8,  "Press and release the brake pedal 2-3 times." },
-    { "Gear",        10,  "Shift through P -> R -> N -> D (hold brake, wait 1s per gear)." },
-    { "Wheel Speed", 15,  "Drive slowly (30+ km/h) — include a turn if possible, then stop." },
+    { "Baseline",     5,
+      "Keep engine running. Do NOT touch any controls.", NULL },
+    { "Steering",     8,
+      "Turn steering wheel to FULL LEFT, then FULL RIGHT (lock to lock). Repeat 2-3 times.",
+      NULL },
+    { "Throttle",     8,
+      "Press accelerator pedal ALL THE WAY down, then release. Repeat 2-3 times.",
+      NULL },
+    { "Brake",        8,
+      "Press brake pedal FIRMLY all the way down, then release. Repeat 2-3 times.",
+      NULL },
+    { "Gear",        10,
+      "Shift through P -> R -> N -> D (hold brake, wait 1s per gear).",
+      "Manual transmission vehicles may not broadcast gear position." },
+    { "Wheel Speed", 15,
+      "Drive slowly (30+ km/h) — include a turn if possible, then stop.",
+      "Requires driving. ABS/ESC may be on a separate CAN bus." },
 };
+
+/** Read a single char from stdin while pumping NSRunLoop for BLE. */
+static int disc_read_char(void) {
+    int ch = 0;
+    while (ch == 0 && g_ble.isConnected) {
+        @autoreleasepool {
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(STDIN_FILENO, &fds);
+            struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
+            if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
+                ch = fgetc(stdin);
+            }
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                     beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+        }
+    }
+    return ch;
+}
+
+/** Capture one phase. Returns false if connection lost. */
+static bool disc_capture_phase(disc_phase_t *phase, int duration_s,
+                                 const char *monitor_cmd) {
+    g_ble->_canLineLen = 0;
+    g_ble.canMonitorActive = YES;
+    g_cli_can_frame_count = 0;
+
+    memset(g_ble->_responseBuf, 0, sizeof(g_ble->_responseBuf));
+    g_ble->_responseLen = 0;
+    g_ble->_responseReady = NO;
+
+    char mon_str[16];
+    snprintf(mon_str, sizeof(mon_str), "%s\r", monitor_cmd);
+    [g_ble sendRawString:mon_str];
+
+    int64_t start_ms = get_timestamp_ms();
+
+    NSDate *endTime = [NSDate dateWithTimeIntervalSinceNow:duration_s];
+    while ([[NSDate date] compare:endTime] == NSOrderedAscending &&
+           g_ble.isConnected && !g_interrupt) {
+        @autoreleasepool {
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                     beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+        }
+    }
+
+    int64_t end_ms = get_timestamp_ms();
+
+    g_ble.canMonitorActive = NO;
+    [g_ble sendRawString:"\r"];
+    run_loop_for(0.2);
+
+    for (int i = 0; i < g_cli_can_frame_count; i++) {
+        disc_phase_add_frame(phase,
+                              g_cli_can_frames[i].can_id,
+                              g_cli_can_frames[i].data,
+                              g_cli_can_frames[i].dlc);
+    }
+    disc_phase_finalize(phase, (double)(end_ms - start_ms) / 1000.0);
+
+    return g_ble.isConnected;
+}
+
+/** Print a candidate result line to stderr */
+static void disc_print_candidate(const char *name, const disc_candidate_t *c) {
+    fprintf(stderr, "    %-12s 0x%03X [%d] @ %.1f Hz  byte %d",
+            name, c->can_id, c->dlc, c->hz, c->byte_idx);
+    if (c->byte2_idx >= 0) fprintf(stderr, ",%d", c->byte2_idx);
+    fprintf(stderr, "  score=%.1f  confidence=%s\n",
+            c->score, disc_confidence_name(c->confidence));
+
+    /* Characterization details (if available) */
+    if (c->signedness != DISC_SIGN_UNKNOWN) {
+        fprintf(stderr, "                 ");
+        if (c->byte2_idx >= 0)
+            fprintf(stderr, "%s-endian ", disc_endian_name(c->endianness));
+        fprintf(stderr, "%s  raw=[%d..%d]\n",
+                disc_sign_name(c->signedness), c->raw_min, c->raw_max);
+    }
+}
 
 static int run_discover(const char *device_prefix) {
     int matchIdx = ptcan_connect(device_prefix);
     (void)matchIdx;
 
-    disc_phase_t phases[DISC_NUM_PHASES];
     const char *monitor_cmd = g_stn_detected ? "STMA" : "ATMA";
 
-    for (int p = 0; p < DISC_NUM_PHASES; p++) {
-        disc_phase_init(&phases[p]);
+    disc_phase_t baseline;
+    disc_phase_init(&baseline);
 
+    /* Exclusion list — grows as signals are confirmed */
+    uint32_t excl[DISC_SIG_COUNT];
+    int excl_count = 0;
+
+    /* Confirmed results */
+    disc_result_t result;
+    memset(&result, 0, sizeof(result));
+    for (int i = 0; i < DISC_SIG_COUNT; i++) {
+        result.signals[i].byte_idx = -1;
+        result.signals[i].byte2_idx = -1;
+    }
+
+    /* === Phase 1: Baseline (mandatory) === */
+    fprintf(stderr, "\n=== Phase 1/%d: Baseline ===\n", DISC_NUM_PHASES);
+    fprintf(stderr, "  %s\n", s_disc_phases[0].instruction);
+    fprintf(stderr, "  Press Enter when ready...");
+    disc_read_char();
+
+    if (!g_ble.isConnected) goto disconnected;
+
+    fprintf(stderr, "  Capturing %d seconds...", s_disc_phases[0].duration_s);
+    fflush(stderr);
+    if (!disc_capture_phase(&baseline, s_disc_phases[0].duration_s, monitor_cmd))
+        goto disconnected;
+    fprintf(stderr, " %d frames, %d CAN IDs\n",
+            baseline.total_frames, baseline.id_count);
+
+    /* === Active phases (2..N) with skip/confirm === */
+    for (int p = 1; p < DISC_NUM_PHASES; p++) {
         fprintf(stderr, "\n=== Phase %d/%d: %s ===\n",
                 p + 1, DISC_NUM_PHASES, s_disc_phases[p].name);
         fprintf(stderr, "  %s\n", s_disc_phases[p].instruction);
-        fprintf(stderr, "  Press Enter when ready...");
-
-        /* Wait for Enter (pump run loop so BLE stays alive) */
-        int ch = 0;
-        while (ch != '\n' && ch != EOF && g_ble.isConnected) {
-            @autoreleasepool {
-                fd_set fds;
-                FD_ZERO(&fds);
-                FD_SET(STDIN_FILENO, &fds);
-                struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 }; /* 50ms */
-                if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
-                    ch = fgetc(stdin);
-                }
-                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
-                                         beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
-            }
-        }
-
-        if (!g_ble.isConnected) {
-            fprintf(stderr, "[ERROR] Connection lost during discover\n");
-            return 1;
-        }
-
-        int duration = s_disc_phases[p].duration_s;
-        fprintf(stderr, "  Capturing %d seconds...", duration);
+        if (s_disc_phases[p].warning)
+            fprintf(stderr, "  NOTE: %s\n", s_disc_phases[p].warning);
+        fprintf(stderr, "  [Enter] proceed  [s] skip > ");
         fflush(stderr);
 
-        /* Start CAN monitor */
-        g_ble->_canLineLen = 0;
-        g_ble.canMonitorActive = YES;
-        g_cli_can_frame_count = 0;
+        int ch = disc_read_char();
+        if (!g_ble.isConnected) goto disconnected;
+        if (ch == 's' || ch == 'S') {
+            fprintf(stderr, "  Skipped.\n");
+            continue;
+        }
 
-        memset(g_ble->_responseBuf, 0, sizeof(g_ble->_responseBuf));
-        g_ble->_responseLen = 0;
-        g_ble->_responseReady = NO;
+        /* Capture */
+        disc_phase_t active;
+        disc_phase_init(&active);
 
-        char mon_str[16];
-        snprintf(mon_str, sizeof(mon_str), "%s\r", monitor_cmd);
-        [g_ble sendRawString:mon_str];
+        fprintf(stderr, "  Capturing %d seconds...", s_disc_phases[p].duration_s);
+        fflush(stderr);
+        if (!disc_capture_phase(&active, s_disc_phases[p].duration_s, monitor_cmd))
+            goto disconnected;
+        fprintf(stderr, " %d frames, %d CAN IDs\n",
+                active.total_frames, active.id_count);
 
-        int64_t start_ms = get_timestamp_ms();
+        /* Analyze this phase */
+        disc_signal_t sig;
+        if      (p == DISC_PHASE_STEERING)    sig = DISC_SIG_STEERING;
+        else if (p == DISC_PHASE_THROTTLE)    sig = DISC_SIG_THROTTLE;
+        else if (p == DISC_PHASE_BRAKE)       sig = DISC_SIG_BRAKE;
+        else if (p == DISC_PHASE_GEAR)        sig = DISC_SIG_GEAR;
+        else if (p == DISC_PHASE_WHEEL_SPEED) sig = DISC_SIG_WHEEL_SPEED;
+        else continue;
 
-        /* Capture loop */
-        NSDate *endTime = [NSDate dateWithTimeIntervalSinceNow:duration];
-        while ([[NSDate date] compare:endTime] == NSOrderedAscending &&
-               g_ble.isConnected && !g_interrupt) {
-            @autoreleasepool {
-                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
-                                         beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+        disc_candidate_t cand = {0};
+        cand.byte_idx = -1;
+        cand.byte2_idx = -1;
+
+        /* For throttle phase: also gets RPM */
+        disc_candidate_t rpm_cand = {0};
+        rpm_cand.byte_idx = -1;
+        rpm_cand.byte2_idx = -1;
+        bool rpm_det = false;
+
+        bool found = disc_classify(&baseline, &active, sig,
+                                    excl, excl_count, &cand,
+                                    &rpm_cand, &rpm_det);
+
+        /* Characterize detected signals */
+        if (found) disc_characterize(&active, &cand);
+        if (rpm_det) disc_characterize(&active, &rpm_cand);
+
+        if (sig == DISC_SIG_THROTTLE) {
+            /* Show RPM result first */
+            if (rpm_det) {
+                disc_print_candidate("rpm", &rpm_cand);
+                fprintf(stderr, "  Include rpm? [y/n] > ");
+                fflush(stderr);
+                int c2 = disc_read_char();
+                if (!g_ble.isConnected) goto disconnected;
+                if (c2 == 'y' || c2 == 'Y' || c2 == '\n') {
+                    result.signals[DISC_SIG_RPM] = rpm_cand;
+                    result.found[DISC_SIG_RPM] = true;
+                    excl[excl_count++] = rpm_cand.can_id;
+                    fprintf(stderr, "  -> rpm included.\n");
+                } else {
+                    fprintf(stderr, "  -> rpm excluded.\n");
+                }
+            } else {
+                fprintf(stderr, "    rpm          not detected\n");
+            }
+
+            /* Show throttle result */
+            if (found) {
+                disc_print_candidate("throttle", &cand);
+                fprintf(stderr, "  Include throttle? [y/n] > ");
+                fflush(stderr);
+                int c2 = disc_read_char();
+                if (!g_ble.isConnected) goto disconnected;
+                if (c2 == 'y' || c2 == 'Y' || c2 == '\n') {
+                    result.signals[DISC_SIG_THROTTLE] = cand;
+                    result.found[DISC_SIG_THROTTLE] = true;
+                    excl[excl_count++] = cand.can_id;
+                    fprintf(stderr, "  -> throttle included.\n");
+                } else {
+                    fprintf(stderr, "  -> throttle excluded.\n");
+                }
+            } else {
+                fprintf(stderr, "    throttle     not detected\n");
+            }
+        } else {
+            /* Single signal phase */
+            const char *sname = disc_signal_name(sig);
+            if (found) {
+                disc_print_candidate(sname, &cand);
+                fprintf(stderr, "  Include %s? [y/n] > ", sname);
+                fflush(stderr);
+                int c2 = disc_read_char();
+                if (!g_ble.isConnected) goto disconnected;
+                if (c2 == 'y' || c2 == 'Y' || c2 == '\n') {
+                    result.signals[sig] = cand;
+                    result.found[sig] = true;
+                    excl[excl_count++] = cand.can_id;
+                    fprintf(stderr, "  -> %s included.\n", sname);
+                } else {
+                    fprintf(stderr, "  -> %s excluded.\n", sname);
+                }
+            } else {
+                fprintf(stderr, "    %-12s not detected\n", sname);
             }
         }
-
-        int64_t end_ms = get_timestamp_ms();
-
-        /* Stop monitoring */
-        g_ble.canMonitorActive = NO;
-        [g_ble sendRawString:"\r"];
-        run_loop_for(0.2);
-
-        /* Feed captured frames into phase stats */
-        for (int i = 0; i < g_cli_can_frame_count; i++) {
-            disc_phase_add_frame(&phases[p],
-                                  g_cli_can_frames[i].can_id,
-                                  g_cli_can_frames[i].data,
-                                  g_cli_can_frames[i].dlc);
-        }
-        double elapsed_s = (double)(end_ms - start_ms) / 1000.0;
-        disc_phase_finalize(&phases[p], elapsed_s);
-
-        fprintf(stderr, " %d frames, %d CAN IDs\n",
-                phases[p].total_frames, phases[p].id_count);
     }
 
-    fprintf(stderr, "\n=== Analyzing... ===\n");
-
-    /* Run analysis */
-    disc_result_t result;
-    disc_analyze(phases, &result);
-
-    /* JSON output (stdout) */
+    /* JSON output (stdout) — only confirmed signals */
     printf("{\n");
     bool first = true;
     for (int s = 0; s < DISC_SIG_COUNT; s++) {
@@ -936,29 +1088,35 @@ static int run_discover(const char *device_prefix) {
             printf(",\"byte\":%d", c->byte_idx);
         if (c->byte2_idx >= 0)
             printf(",\"byte2\":%d", c->byte2_idx);
-        printf(",\"score\":%.1f}", c->score);
+        printf(",\"score\":%.1f,\"confidence\":\"%s\"",
+               c->score, disc_confidence_name(c->confidence));
+        if (c->byte2_idx >= 0 && c->endianness != DISC_ENDIAN_UNKNOWN)
+            printf(",\"endian\":\"%s\"", disc_endian_name(c->endianness));
+        if (c->signedness != DISC_SIGN_UNKNOWN)
+            printf(",\"signed\":%s", c->signedness == DISC_SIGN_SIGNED ? "true" : "false");
+        if (c->signedness != DISC_SIGN_UNKNOWN)
+            printf(",\"raw_min\":%d,\"raw_max\":%d", c->raw_min, c->raw_max);
+        printf("}");
     }
     if (!first) printf("\n");
     printf("}\n");
 
     /* Summary to stderr */
-    fprintf(stderr, "\n=== Results ===\n");
+    fprintf(stderr, "\n=== Final Results ===\n");
     for (int s = 0; s < DISC_SIG_COUNT; s++) {
         if (result.found[s]) {
-            const disc_candidate_t *c = &result.signals[s];
-            fprintf(stderr, "  %-10s  0x%03X [%d] @ %.1f Hz  byte %d",
-                    disc_signal_name((disc_signal_t)s),
-                    c->can_id, c->dlc, c->hz, c->byte_idx);
-            if (c->byte2_idx >= 0) fprintf(stderr, ",%d", c->byte2_idx);
-            fprintf(stderr, "  (score %.1f)\n", c->score);
-        } else {
-            fprintf(stderr, "  %-10s  not found\n", disc_signal_name((disc_signal_t)s));
+            disc_print_candidate(disc_signal_name((disc_signal_t)s),
+                                  &result.signals[s]);
         }
     }
 
     [g_ble disconnect];
     g_interrupt = NO;
     return 0;
+
+disconnected:
+    fprintf(stderr, "\n[ERROR] Connection lost during discover\n");
+    return 1;
 }
 
 /*******************************************************************************

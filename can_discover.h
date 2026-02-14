@@ -103,6 +103,28 @@ typedef struct {
 } disc_phase_t;
 
 /*******************************************************************************
+ * Confidence / Characterization Enums
+ ******************************************************************************/
+
+typedef enum {
+    DISC_CONF_HIGH = 0,         /**< Preferred pattern matched */
+    DISC_CONF_MEDIUM,           /**< Secondary pattern matched */
+    DISC_CONF_LOW               /**< Fallback (highest score only) */
+} disc_confidence_t;
+
+typedef enum {
+    DISC_ENDIAN_UNKNOWN = 0,
+    DISC_ENDIAN_BIG,            /**< MSB at lower byte index */
+    DISC_ENDIAN_LITTLE          /**< LSB at lower byte index */
+} disc_endian_t;
+
+typedef enum {
+    DISC_SIGN_UNKNOWN = 0,
+    DISC_SIGN_UNSIGNED,
+    DISC_SIGN_SIGNED
+} disc_sign_t;
+
+/*******************************************************************************
  * Analysis Results
  ******************************************************************************/
 
@@ -114,6 +136,12 @@ typedef struct {
     int      byte_idx;          /**< Primary byte index (-1 if none) */
     int      byte2_idx;         /**< Secondary byte index (-1 if none) */
     double   score;             /**< Change score */
+    disc_confidence_t confidence; /**< Detection confidence */
+    /* Characterization (filled by disc_characterize) */
+    disc_endian_t endianness;   /**< Byte order (2-byte signals only) */
+    disc_sign_t   signedness;   /**< Signed/unsigned */
+    int32_t       raw_min;      /**< Observed minimum raw value */
+    int32_t       raw_max;      /**< Observed maximum raw value */
 } disc_candidate_t;
 
 /** Final discovery results for all signals */
@@ -164,11 +192,60 @@ void disc_analyze(const disc_phase_t phases[DISC_NUM_PHASES],
                    disc_result_t *result);
 
 /**
+ * @brief Classify a single signal from one phase
+ *
+ * Compares active phase against baseline, runs the appropriate classifier,
+ * and returns the best candidate with confidence level.
+ * For DISC_SIG_THROTTLE phase, also outputs RPM (rpm_out, rpm_found).
+ *
+ * @param baseline Baseline phase capture
+ * @param active   Active phase capture
+ * @param signal   Signal type to classify
+ * @param excl     CAN IDs to exclude (already-identified signals)
+ * @param excl_count Number of excluded IDs
+ * @param out      Output: best candidate
+ * @param rpm_out  Output: RPM candidate (only for DISC_SIG_THROTTLE, may be NULL)
+ * @param rpm_found Output: whether RPM was found (only for DISC_SIG_THROTTLE, may be NULL)
+ * @return true if signal was found
+ */
+bool disc_classify(const disc_phase_t *baseline,
+                   const disc_phase_t *active,
+                   disc_signal_t signal,
+                   const uint32_t *excl, int excl_count,
+                   disc_candidate_t *out,
+                   disc_candidate_t *rpm_out, bool *rpm_found);
+
+/**
+ * @brief Characterize a detected signal (endianness, signedness, raw range)
+ *
+ * Analyzes the byte-level statistics from the active phase to determine
+ * data type properties. Should be called after disc_classify() succeeds.
+ * Requires full-range input during capture for accurate results.
+ *
+ * @param active Active phase capture (where the signal was detected)
+ * @param cand   Candidate to characterize (modified in-place)
+ */
+void disc_characterize(const disc_phase_t *active, disc_candidate_t *cand);
+
+/**
  * @brief Get human-readable name for a signal type
- * @param sig Signal type
- * @return Signal name string
  */
 const char *disc_signal_name(disc_signal_t sig);
+
+/**
+ * @brief Get human-readable name for a confidence level
+ */
+const char *disc_confidence_name(disc_confidence_t conf);
+
+/**
+ * @brief Get human-readable name for endianness
+ */
+const char *disc_endian_name(disc_endian_t e);
+
+/**
+ * @brief Get human-readable name for signedness
+ */
+const char *disc_sign_name(disc_sign_t s);
 
 #ifdef __cplusplus
 }
